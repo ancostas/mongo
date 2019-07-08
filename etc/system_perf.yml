@@ -792,9 +792,9 @@ tasks:
 # be sure to add the module to git.get_project revisions parameter
 modules:
 - name: dsi
-  repo: git@github.com:ancostas/dsi.git
+  repo: git@github.com:10gen/dsi.git
   prefix: dsi
-  branch: SERVER-41677
+  branch: master
 
 - name: genny
   repo: git@github.com:10gen/genny.git
