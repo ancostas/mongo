@@ -327,7 +327,11 @@ functions:
       params:
         working_dir: work
         script: |
-          ../src/dsi/dsi/run-dsi detect-changes
+          git clone git@github.com:10gen/signal-processing.git --branch 1.0.0 --single-branch
+          virtualenv -p /opt/mongodbtoolchain/v3/bin/python3 signal_processing_venv
+          source ./signal_processing_venv/bin/activate
+          pip install ./signal-processing
+          detect-changes --mongo-uri mongodb+srv://${dsi_analysis_atlas_user}:${dsi_analysis_atlas_pw}@performancedata-g6tsc.mongodb.net/perf $([[ "${is_patch}" == "true" ]] && echo '--is-patch' || echo '--is-not-patch') --task-id ${task_id}
     - command: shell.exec
       type: test
       params:
@@ -343,7 +347,8 @@ functions:
       params:
         working_dir: work
         script: |
-          ../src/dsi/dsi/run-dsi detect-outliers
+          source ./signal_processing_venv/bin/activate
+          detect-outliers --mongo-uri mongodb+srv://${dsi_analysis_atlas_user}:${dsi_analysis_atlas_pw}@performancedata-g6tsc.mongodb.net/perf $([[ "${is_patch}" == "true" ]] && echo '--is-patch' || echo '--is-not-patch') --task-id ${task_id}
     - command: shell.exec
       type: setup
       params:
