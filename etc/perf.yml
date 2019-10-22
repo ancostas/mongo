@@ -185,6 +185,7 @@ functions:
         script: |
           set -o errexit
           set -o verbose
+          ./dsi/run-dsi setup
           source ./dsi/dsi_venv/bin/activate
 
           # Any tasks that want the analysis scripts to analyze mongod.log files should pass in
