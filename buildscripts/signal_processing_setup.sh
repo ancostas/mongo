@@ -4,7 +4,7 @@ if [[ -d "signal_processing_venv" ]]; then
     exit 0
 fi
 cat > ./analysis.yml << EOF
-mongo_uri: mongodb+srv://${dsi_analysis_atlas_user}:${dsi_analysis_atlas_pw}@performancedata-g6tsc.mongodb.net/perf
+mongo_uri: mongodb+srv://\${analysis_user}:\${analysis_password}@performancedata-g6tsc.mongodb.net/perf
 is_patch: ${is_patch}
 task_id: ${task_id}
 EOF
@@ -16,3 +16,6 @@ extra-index-url = https://${perf_jira_user}:${perf_jira_pw}@artifactory.corp.mon
 EOF
 source ./signal_processing_venv/bin/activate
 pip install dag-signal-processing~=1.0
+
+export analysis_user="${dsi_analysis_atlas_user}"
+export analysis_password="${dsi_analysis_atlas_pw}"
