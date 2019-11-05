@@ -335,8 +335,8 @@ functions:
           dsi_analysis_atlas_pw=${dsi_analysis_atlas_pw}
           evergreen_api_key=${evergreen_api_key}
           evergreen_api_user=${evergreen_api_user}
-          source ./buildscripts/signal_processing_setup.sh
-          detect-changes
+          source ../src/buildscripts/signal_processing_setup.sh
+          detect-changes --evergreen-api-config .evergreen.yml
     - command: shell.exec
       type: test
       params:
@@ -352,8 +352,8 @@ functions:
       params:
         working_dir: work
         script: |
-          source buildscripts/signal_processing_setup.sh
-          detect-outliers
+          source ../src/buildscripts/signal_processing_setup.sh
+          detect-outliers --evergreen-api-config .evergreen.yml
     - command: shell.exec
       type: setup
       params:
