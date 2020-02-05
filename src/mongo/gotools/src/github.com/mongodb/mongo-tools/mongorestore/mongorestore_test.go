@@ -8,6 +8,7 @@ package mongorestore
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"os"
 	"testing"
@@ -346,4 +347,143 @@ func TestMongorestoreMIOSOE(t *testing.T) {
 	})
 
 	_ = database.Drop(nil)
+}
+
+func TestDeprecatedIndexOptions(t *testing.T) {
+	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
+	session, err := testutil.GetBareSession()
+	if err != nil {
+		t.Fatalf("No server available")
+	}
+
+	Convey("With a test MongoRestore", t, func() {
+		args := []string{
+			NumParallelCollectionsOption, "1",
+			NumInsertionWorkersOption, "1",
+		}
+
+		restore, err := getRestoreWithArgs(args...)
+		So(err, ShouldBeNil)
+
+		session, _ = restore.SessionProvider.GetSession()
+
+		db := session.Database("indextest")
+
+		coll := db.Collection("test_collection")
+		coll.Drop(nil)
+		defer func() {
+			coll.Drop(nil)
+		}()
+		Convey("Creating index with invalid option should throw error", func() {
+			restore.TargetDirectory = "testdata/indextestdump"
+			result := restore.Restore()
+			So(result.Err, ShouldNotBeNil)
+			So(result.Err.Error(), ShouldStartWith, `indextest.test_collection: error creating indexes for indextest.test_collection: createIndex error: (InvalidIndexSpecificationOption)`)
+
+			So(result.Successes, ShouldEqual, 100)
+			So(result.Failures, ShouldEqual, 0)
+			count, err := coll.CountDocuments(nil, bson.M{})
+			So(err, ShouldBeNil)
+			So(count, ShouldEqual, 100)
+		})
+
+		coll.Drop(nil)
+
+		args = []string{
+			NumParallelCollectionsOption, "1",
+			NumInsertionWorkersOption, "1",
+			ConvertLegacyIndexesOption, "true",
+		}
+
+		restore, err = getRestoreWithArgs(args...)
+		So(err, ShouldBeNil)
+
+		Convey("Creating index with invalid option and --ignoreInvalidIndexOptions should succeed", func() {
+			restore.TargetDirectory = "testdata/indextestdump"
+			result := restore.Restore()
+			So(result.Err, ShouldBeNil)
+
+			So(result.Successes, ShouldEqual, 100)
+			So(result.Failures, ShouldEqual, 0)
+			count, err := coll.CountDocuments(nil, bson.M{})
+			So(err, ShouldBeNil)
+			So(count, ShouldEqual, 100)
+		})
+	})
+}
+
+func TestRestoreUsersOrRoles(t *testing.T) {
+	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
+	session, err := testutil.GetBareSession()
+	if err != nil {
+		t.Fatalf("No server available")
+	}
+
+	Convey("With a test MongoRestore", t, func() {
+		args := []string{
+			NumParallelCollectionsOption, "1",
+			NumInsertionWorkersOption, "1",
+		}
+
+		restore, err := getRestoreWithArgs(args...)
+		So(err, ShouldBeNil)
+
+		session, _ = restore.SessionProvider.GetSession()
+
+		db := session.Database("admin")
+
+		Convey("Restoring users and roles should drop tempusers and temproles", func() {
+			restore.TargetDirectory = "testdata/usersdump"
+			result := restore.Restore()
+			So(result.Err, ShouldBeNil)
+
+			adminCollections, err := db.ListCollectionNames(context.Background(), bson.M{})
+			So(err, ShouldBeNil)
+
+			for _, collName := range adminCollections {
+				So(collName, ShouldNotEqual, "tempusers")
+				So(collName, ShouldNotEqual, "temproles")
+			}
+		})
+	})
+}
+
+func TestKnownCollections(t *testing.T) {
+	testtype.SkipUnlessTestType(t, testtype.IntegrationTestType)
+	session, err := testutil.GetBareSession()
+	if err != nil {
+		t.Fatalf("No server available")
+	}
+
+	Convey("With a test MongoRestore", t, func() {
+		args := []string{
+			NumParallelCollectionsOption, "1",
+			NumInsertionWorkersOption, "1",
+		}
+
+		restore, err := getRestoreWithArgs(args...)
+		So(err, ShouldBeNil)
+
+		session, _ = restore.SessionProvider.GetSession()
+		db := session.Database("test")
+		defer func() {
+			db.Collection("foo").Drop(nil)
+		}()
+
+		Convey("Once collection foo has been restored, it should exist in restore.knownCollections", func() {
+			restore.TargetDirectory = "testdata/foodump"
+			result := restore.Restore()
+			So(result.Err, ShouldBeNil)
+
+			var namespaceExistsInCache bool
+			if cols, ok := restore.knownCollections["test"]; ok {
+				for _, collName := range cols {
+					if collName == "foo" {
+						namespaceExistsInCache = true
+					}
+				}
+			}
+			So(namespaceExistsInCache, ShouldBeTrue)
+		})
+	})
 }

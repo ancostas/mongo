@@ -181,7 +181,7 @@ Update MongoInterfaceStandalone::buildUpdateOp(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     const NamespaceString& nss,
     BatchedObjects&& batch,
-    bool upsert,
+    UpsertType upsert,
     bool multi) {
     Update updateOp(nss);
     updateOp.setUpdates([&] {
@@ -193,7 +193,9 @@ Update MongoInterfaceStandalone::buildUpdateOp(
                 entry.setQ(std::move(q));
                 entry.setU(std::move(u));
                 entry.setC(std::move(c));
-                entry.setUpsert(upsert);
+                entry.setUpsert(upsert != UpsertType::kNone);
+                entry.setUpsertSupplied({{entry.getUpsert() && expCtx->useNewUpsert,
+                                          upsert == UpsertType::kInsertSuppliedDoc}});
                 entry.setMulti(multi);
                 return entry;
             }());
@@ -232,7 +234,7 @@ StatusWith<MongoProcessInterface::UpdateResult> MongoInterfaceStandalone::update
     const NamespaceString& ns,
     BatchedObjects&& batch,
     const WriteConcernOptions& wc,
-    bool upsert,
+    UpsertType upsert,
     bool multi,
     boost::optional<OID> targetEpoch) {
     auto writeResults =
@@ -424,14 +426,20 @@ boost::optional<Document> MongoInterfaceStandalone::lookupSingleDocument(
             nss,
             collectionUUID,
             _getCollectionDefaultCollator(expCtx->opCtx, nss.db(), collectionUUID));
-        pipeline = makePipeline({BSON("$match" << documentKey)}, foreignExpCtx);
+        // When looking up on a mongoD, we only ever want to read from the local collection. By
+        // default, makePipeline will attach a cursor source which may read from remote if the
+        // collection is sharded, so we manually attach a local-only cursor source here.
+        MakePipelineOptions opts;
+        opts.attachCursorSource = false;
+        pipeline = makePipeline({BSON("$match" << documentKey)}, foreignExpCtx, opts);
+        pipeline = attachCursorSourceToPipelineForLocalRead(foreignExpCtx, pipeline.release());
     } catch (const ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
         return boost::none;
     }
 
     auto lookedUpDocument = pipeline->getNext();
     if (auto next = pipeline->getNext()) {
-        uasserted(ErrorCodes::TooManyMatchingDocuments,
+        uasserted(ErrorCodes::ChangeStreamFatalError,
                   str::stream() << "found more than one document with document key "
                                 << documentKey.toString() << " [" << lookedUpDocument->toString()
                                 << ", " << next->toString() << "]");

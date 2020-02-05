@@ -87,6 +87,10 @@ namespace mongo {
 
 namespace {
 
+using UniqueX509StoreCtx =
+    std::unique_ptr<X509_STORE_CTX,
+                    OpenSSLDeleter<decltype(X509_STORE_CTX_free), ::X509_STORE_CTX_free>>;
+
 // Modulus for Diffie-Hellman parameter 'ffdhe3072' defined in RFC 7919
 constexpr std::array<std::uint8_t, 384> ffdhe3072_p = {
     0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xAD, 0xF8, 0x54, 0x58, 0xA2, 0xBB, 0x4A, 0x9A,
@@ -244,6 +248,33 @@ inline int X509_NAME_ENTRY_set(const X509_NAME_ENTRY* ne) {
     return ne->set;
 }
 
+// On OpenSSL < 1.1.0, this chain isn't attached to
+// the SSL session, so we need it to dispose of itself.
+struct VerifiedChainDeleter {
+    void operator()(STACK_OF(X509) * chain) {
+        if (chain) {
+            sk_X509_pop_free(chain, X509_free);
+        }
+    }
+};
+
+STACK_OF(X509) * SSL_get0_verified_chain(SSL* s) {
+    auto* store = SSL_CTX_get_cert_store(SSL_get_SSL_CTX(s));
+    auto* peer = SSL_get_peer_certificate(s);
+    auto* peerChain = SSL_get_peer_cert_chain(s);
+
+    UniqueX509StoreCtx ctx(X509_STORE_CTX_new());
+    if (!X509_STORE_CTX_init(ctx.get(), store, peer, peerChain)) {
+        return nullptr;
+    }
+
+    if (X509_verify_cert(ctx.get()) <= 0) {
+        return nullptr;
+    }
+
+    return X509_STORE_CTX_get1_chain(ctx.get());
+}
+
 int DH_set0_pqg(DH* dh, BIGNUM* p, BIGNUM* q, BIGNUM* g) {
     dh->p = p;
     dh->g = g;
@@ -260,7 +291,17 @@ void DH_get0_pqg(const DH* dh, const BIGNUM** p, const BIGNUM** q, const BIGNUM*
         *g = dh->g;
     }
 }
+#else
+// No-op deleter for OpenSSL >= 1.1.0
+struct VerifiedChainDeleter {
+    void operator()(STACK_OF(X509) * chain) {}
+};
 #endif
+
+using UniqueVerifiedChainPolyfill = std::unique_ptr<STACK_OF(X509), VerifiedChainDeleter>;
+UniqueVerifiedChainPolyfill SSLgetVerifiedChain(SSL* s) {
+    return UniqueVerifiedChainPolyfill(SSL_get0_verified_chain(s));
+}
 
 /**
  * Multithreaded Support for SSL.
@@ -1475,6 +1516,67 @@ StatusWith<TLSVersion> mapTLSVersion(SSL* conn) {
     }
 }
 
+namespace {
+Status _validatePeerRoles(const stdx::unordered_set<RoleName>& embeddedRoles, SSL* conn) {
+    if (embeddedRoles.empty()) {
+        // Nothing offered, nothing to restrict.
+        return Status::OK();
+    }
+
+    if (!sslGlobalParams.tlsCATrusts) {
+        // Nothing restricted.
+        return Status::OK();
+    }
+
+    const auto& tlsCATrusts = sslGlobalParams.tlsCATrusts.get();
+    if (tlsCATrusts.empty()) {
+        // Nothing permitted.
+        return {ErrorCodes::BadValue,
+                "tlsCATrusts parameter prohibits role based authorization via X509 certificates"};
+    }
+
+    auto stack = SSLgetVerifiedChain(conn);
+    if (!stack || !sk_X509_num(stack.get())) {
+        return {ErrorCodes::BadValue, "Unable to obtain certificate chain"};
+    }
+
+    auto root = sk_X509_value(stack.get(), sk_X509_num(stack.get()) - 1);
+    SHA256Block::HashType digest;
+    if (!X509_digest(root, EVP_sha256(), digest.data(), nullptr)) {
+        return {ErrorCodes::BadValue, "Unable to digest root certificate"};
+    }
+
+    SHA256Block sha256(digest);
+    auto it = tlsCATrusts.find(sha256);
+    if (it == tlsCATrusts.end()) {
+        return {
+            ErrorCodes::BadValue,
+            str::stream() << "CA: " << sha256.toHexString()
+                          << " is not authorized to grant any roles due to tlsCATrusts parameter"};
+    }
+
+    auto allowedRoles = it->second;
+    // See TLSCATrustsSetParameter::set() for a description of tlsCATrusts format.
+    if (allowedRoles.count(RoleName("", ""))) {
+        // CA is authorized for all role assignments.
+        return Status::OK();
+    }
+
+    for (const auto& role : embeddedRoles) {
+        // Check for exact match or wildcard matches.
+        if (!allowedRoles.count(role) && !allowedRoles.count(RoleName(role.getRole(), "")) &&
+            !allowedRoles.count(RoleName("", role.getDB()))) {
+            return {ErrorCodes::BadValue,
+                    str::stream() << "CA: " << sha256.toHexString()
+                                  << " is not authorized to grant role " << role.toString()
+                                  << " due to tlsCATrusts parameter"};
+        }
+    }
+
+    return Status::OK();
+}
+}  // namespace
+
 StatusWith<SSLPeerInfo> SSLManagerOpenSSL::parseAndValidatePeerCertificate(
     SSL* conn, const std::string& remoteHost, const HostAndPort& hostForLogging) {
     auto sniName = getRawSNIServerName(conn);
@@ -1534,6 +1636,10 @@ StatusWith<SSLPeerInfo> SSLManagerOpenSSL::parseAndValidatePeerCertificate(
     StatusWith<stdx::unordered_set<RoleName>> swPeerCertificateRoles = _parsePeerRoles(peerCert);
     if (!swPeerCertificateRoles.isOK()) {
         return swPeerCertificateRoles.getStatus();
+    }
+
+    if (auto status = _validatePeerRoles(swPeerCertificateRoles.getValue(), conn); !status.isOK()) {
+        return status;
     }
 
     // If this is an SSL client context (on a MongoDB server or client)

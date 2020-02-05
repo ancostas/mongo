@@ -96,8 +96,11 @@ namespace mr {
 namespace {
 
 Rarely mapParamsDeprecationSampler;  // Used to occasionally log deprecation messages.
-// Used to log occassional deprecation warnings when CodeWScope is used in MapReduce.
+// Used to log occasional deprecation warnings when CodeWScope is used in MapReduce.
 Rarely mapReduceCodeWScopeSampler;
+// Used to log occasional deprecation warnings when $near or $where are used in MapReduce.
+Rarely mapReduceNearSampler;
+Rarely mapReduceWhereSampler;
 
 
 /**
@@ -224,6 +227,22 @@ void dropTempCollections(OperationContext* cleanupOpCtx,
 
         ShardConnection::forgetNS(incLong.ns());
     }
+}
+/**
+ * Recursive method which verifies that the query option specified to mapReduce does not use the
+ * specified match type.
+ */
+bool queryContainsMatchType(MatchExpression* root, MatchExpression::MatchType match) {
+    if (root->matchType() == match) {
+        return false;
+    } else if (root->numChildren() > 0) {
+        for (size_t i = 0; i < root->numChildren(); i++) {
+            if (!queryContainsMatchType(root->getChild(i), match)) {
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 }  // namespace
@@ -739,11 +758,16 @@ long long State::postProcessCollectionNonAtomic(OperationContext* opCtx,
     // Make sure we enforce prepare conflicts before writing.
     EnforcePrepareConflictsBlock enforcePrepare(opCtx);
 
-    if (_config.outputOptions.finalNamespace == _config.tempNamespace)
-        return collectionCount(opCtx, _config.outputOptions.finalNamespace, callerHoldsGlobalLock);
+    auto outputCount =
+        collectionCount(opCtx, _config.outputOptions.finalNamespace, callerHoldsGlobalLock);
 
-    if (_config.outputOptions.outType == Config::REPLACE ||
-        collectionCount(opCtx, _config.outputOptions.finalNamespace, callerHoldsGlobalLock) == 0) {
+    // Determine whether the temp collection should be renamed to the final output collection and
+    // thus preserve the UUID. This is possible in the following cases:
+    //  * Output mode "replace"
+    //  * If this mapReduce is creating a new sharded output collection, which can be determined by
+    //  whether mongos sent the UUID that the final output collection should have (that is, whether
+    //  _config.finalOutputCollUUID is set).
+    if (_config.outputOptions.outType == Config::REPLACE || _config.finalOutputCollUUID) {
         // This must be global because we may write across different databases.
         Lock::GlobalWrite lock(opCtx);
         // replace: just rename from temp to final collection name, dropping previous collection
@@ -761,12 +785,10 @@ long long State::postProcessCollectionNonAtomic(OperationContext* opCtx,
         _db.dropCollection(_config.tempNamespace.ns());
     } else if (_config.outputOptions.outType == Config::MERGE) {
         // merge: upsert new docs into old collection
-        const auto count = collectionCount(opCtx, _config.tempNamespace, callerHoldsGlobalLock);
-
         ProgressMeterHolder pm;
         {
             stdx::unique_lock<Client> lk(*opCtx->getClient());
-            pm.set(curOp->setProgress_inlock("M/R Merge Post Processing", count));
+            pm.set(curOp->setProgress_inlock("M/R Merge Post Processing", outputCount));
         }
 
         unique_ptr<DBClientCursor> cursor = _db.query(_config.tempNamespace, BSONObj());
@@ -782,12 +804,10 @@ long long State::postProcessCollectionNonAtomic(OperationContext* opCtx,
         // reduce: apply reduce op on new result and existing one
         BSONList values;
 
-        const auto count = collectionCount(opCtx, _config.tempNamespace, callerHoldsGlobalLock);
-
         ProgressMeterHolder pm;
         {
             stdx::unique_lock<Client> lk(*opCtx->getClient());
-            pm.set(curOp->setProgress_inlock("M/R Reduce Post Processing", count));
+            pm.set(curOp->setProgress_inlock("M/R Reduce Post Processing", outputCount));
         }
 
         unique_ptr<DBClientCursor> cursor = _db.query(_config.tempNamespace, BSONObj());
@@ -799,7 +819,6 @@ long long State::postProcessCollectionNonAtomic(OperationContext* opCtx,
 
             const bool found = [&] {
                 AutoGetCollection autoColl(opCtx, _config.outputOptions.finalNamespace, MODE_IS);
-                assertCollectionNotNull(_config.outputOptions.finalNamespace, autoColl);
                 return Helpers::findOne(
                     opCtx, autoColl.getCollection(), temp["_id"].wrap(), old, true);
             }();
@@ -1544,6 +1563,15 @@ public:
                                                  extensionsCallback,
                                                  MatchExpressionParser::kAllowAllSpecialFeatures),
                     str::stream() << "Can't canonicalize query " << config.filter);
+
+                if (!queryContainsMatchType(cq->root(), MatchExpression::MatchType::GEO_NEAR) &&
+                    mapReduceNearSampler.tick()) {
+                    warning() << "The use of $near in the query option to MapReduce is deprecated";
+                }
+                if (!queryContainsMatchType(cq->root(), MatchExpression::MatchType::WHERE) &&
+                    mapReduceWhereSampler.tick()) {
+                    warning() << "The use of $where in the query option to MapReduce is deprecated";
+                }
 
                 auto exec = uassertStatusOK(getExecutor(opCtx,
                                                         scopedAutoColl->getCollection(),

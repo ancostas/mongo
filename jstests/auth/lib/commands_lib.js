@@ -5448,8 +5448,15 @@ var authCommandsLib = {
           testcases: [
               {
                 runOnDb: adminDbName,
-                roles: roles_clusterManager,
                 privileges: [{resource: {db: 'config', collection: 'shards'}, actions: ['update']}],
+              },
+              {
+                runOnDb: adminDbName,
+                roles: roles_clusterManager,
+              },
+              {
+                runOnDb: adminDbName,
+                privileges: [{resource: {cluster: true}, actions: ["enableSharding"]}],
               },
           ]
         },
@@ -5468,11 +5475,18 @@ var authCommandsLib = {
           testcases: [
               {
                 runOnDb: adminDbName,
-                roles: roles_clusterManager,
                 privileges: [
                     {resource: {db: 'config', collection: 'shards'}, actions: ['update']},
                     {resource: {db: 'config', collection: 'tags'}, actions: ['find']}
                 ],
+              },
+              {
+                runOnDb: adminDbName,
+                roles: roles_clusterManager,
+              },
+              {
+                runOnDb: adminDbName,
+                privileges: [{resource: {cluster: true}, actions: ["enableSharding"]}],
               },
           ]
         },
@@ -5491,7 +5505,6 @@ var authCommandsLib = {
           testcases: [
               {
                 runOnDb: adminDbName,
-                roles: roles_clusterManager,
                 privileges: [
                     {resource: {db: 'config', collection: 'shards'}, actions: ['find']},
                     {
@@ -5500,6 +5513,16 @@ var authCommandsLib = {
                     },
                 ],
                 expectFail: true
+              },
+              {
+                runOnDb: adminDbName,
+                roles: roles_clusterManager,
+                expectFail: true,
+              },
+              {
+                runOnDb: adminDbName,
+                privileges: [{resource: {cluster: true}, actions: ["enableSharding"]}],
+                expectFail: true,
               },
           ]
         },
@@ -5624,6 +5647,35 @@ var authCommandsLib = {
           setup: function(db) {
               db.runCommand({startRecordingTraffic: 1, filename: "notARealPath"});
           }
+        },
+        {
+          testname: "clearJumboFlag",
+          command: {clearJumboFlag: "test.x"},
+          skipUnlessSharded: true,
+          testcases: [
+              {
+                runOnDb: adminDbName,
+                roles: roles_clusterManager,
+                privileges: [{resource: {db: "test", collection: "x"}, actions: ["clearJumboFlag"]}],
+                expectFail: true
+              },
+              {runOnDb: firstDbName, roles: {}},
+              {runOnDb: secondDbName, roles: {}}
+          ]
+        },
+        {
+          testname: "_configsvrClearJumboFlag",
+          command: {_configsvrClearJumboFlag: "x.y", epoch: ObjectId(), minKey: {x: 0}, maxKey: {x: 10}},
+          skipSharded: true,
+          expectFail: true,
+          testcases: [
+              {
+                runOnDb: adminDbName,
+                roles: {__system: 1},
+                privileges: [{resource: {cluster: true}, actions: ["internal"]}],
+                expectFail: true
+              },
+          ]
         },
     ],
 

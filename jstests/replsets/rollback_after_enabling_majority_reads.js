@@ -27,7 +27,7 @@ config.members[2].priority = 0;
 config.settings = {
     chainingAllowed: false
 };
-replTest.initiate(config);
+replTest.initiateWithHighElectionTimeout(config);
 let rollbackTest = new RollbackTest(name, replTest);
 
 jsTest.log("Ensure the stable timestamp is ahead of the common point on the rollback node.");
@@ -78,7 +78,7 @@ let node = replTest.nodes[0];
 jsTestLog("Waiting for node " + node.host + " to become primary.");
 replTest.awaitNodesAgreeOnPrimary();
 // Wait until the node has finished starting up before running replSetStepUp.
-replTest.waitForState(node, ReplSetTest.State.SECONDARY);
+replTest.awaitSecondaryNodes(ReplSetTest.kDefaultTimeoutMS, [node]);
 assert.commandWorked(node.adminCommand({replSetStepUp: 1}));
 replTest.waitForState(node, ReplSetTest.State.PRIMARY);
 assert.eq(replTest.getPrimary(), node, node.host + " was not primary after step up.");

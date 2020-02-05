@@ -78,8 +78,14 @@ void assertOILIsAscendingLocally(const vector<Interval>& intervals, size_t idx) 
 }
 
 // Tightness rules are shared for $lt, $lte, $gt, $gte.
-IndexBoundsBuilder::BoundsTightness getInequalityPredicateTightness(const BSONElement& dataElt,
+IndexBoundsBuilder::BoundsTightness getInequalityPredicateTightness(const Interval& interval,
+                                                                    const BSONElement& dataElt,
                                                                     const IndexEntry& index) {
+    if (interval.isNull()) {
+        // Any time the bounds are empty, we consider them to be exact.
+        return IndexBoundsBuilder::EXACT;
+    }
+
     return Indexability::isExactBoundsGenerating(dataElt) ? IndexBoundsBuilder::EXACT
                                                           : IndexBoundsBuilder::INEXACT_FETCH;
 }
@@ -139,7 +145,9 @@ void makeNullEqualityBounds(const IndexEntry& index,
 }
 
 bool isEqualityOrInNull(MatchExpression* me) {
-    if (MatchExpression::EQ == me->matchType()) {
+    // Because of type-bracketing, {$gte: null} and {$lte: null} are equivalent to {$eq: null}.
+    if (MatchExpression::EQ == me->matchType() || MatchExpression::GTE == me->matchType() ||
+        MatchExpression::LTE == me->matchType()) {
         return static_cast<ComparisonMatchExpression*>(me)->getData().type() == BSONType::jstNULL;
     }
 
@@ -439,8 +447,12 @@ void IndexBoundsBuilder::_translatePredicate(const MatchExpression* expr,
             *tightnessOut = IndexBoundsBuilder::EXACT;
         }
 
-        // If this invariant would fail, we would otherwise return incorrect query results.
-        invariant(*tightnessOut == IndexBoundsBuilder::EXACT);
+        // This disables indexed negation of array inequality.
+        // TODO: SERVER-45233 Perform correct behavior here once indexed array inequality without
+        // negation's semantics are correctly determined and implemented.
+        massert(ErrorCodes::InternalError,
+                "Indexed negation of array inequality not supported.",
+                *tightnessOut == IndexBoundsBuilder::EXACT);
 
         // If the index is multikey on this path, it doesn't matter what the tightness of the child
         // is, we must return INEXACT_FETCH. Consider a multikey index on 'a' with document
@@ -508,6 +520,13 @@ void IndexBoundsBuilder::_translatePredicate(const MatchExpression* expr,
             return;
         }
 
+        if (BSONType::jstNULL == dataElt.type()) {
+            // Because of type-bracketing, $lte null is equivalent to $eq null. An equality to null
+            // query is special. It should return both undefined and null values.
+            makeNullEqualityBounds(index, isHashed, oilOut, tightnessOut);
+            return;
+        }
+
         BSONObjBuilder bob;
         // Use -infinity for one-sided numerical bounds
         if (dataElt.isNumber()) {
@@ -518,10 +537,12 @@ void IndexBoundsBuilder::_translatePredicate(const MatchExpression* expr,
         CollationIndexKey::collationAwareIndexKeyAppend(dataElt, index.collator, &bob);
         BSONObj dataObj = bob.obj();
         verify(dataObj.isOwned());
-        oilOut->intervals.push_back(makeRangeInterval(
-            dataObj, IndexBounds::makeBoundInclusionFromBoundBools(typeMatch(dataObj), true)));
 
-        *tightnessOut = getInequalityPredicateTightness(dataElt, index);
+        const Interval interval = makeRangeInterval(
+            dataObj, IndexBounds::makeBoundInclusionFromBoundBools(typeMatch(dataObj), true));
+        oilOut->intervals.push_back(interval);
+
+        *tightnessOut = getInequalityPredicateTightness(interval, dataElt, index);
     } else if (MatchExpression::LT == expr->matchType()) {
         const LTMatchExpression* node = static_cast<const LTMatchExpression*>(expr);
         BSONElement dataElt = node->getData();
@@ -559,7 +580,7 @@ void IndexBoundsBuilder::_translatePredicate(const MatchExpression* expr,
             oilOut->intervals.push_back(interval);
         }
 
-        *tightnessOut = getInequalityPredicateTightness(dataElt, index);
+        *tightnessOut = getInequalityPredicateTightness(interval, dataElt, index);
     } else if (MatchExpression::GT == expr->matchType()) {
         const GTMatchExpression* node = static_cast<const GTMatchExpression*>(expr);
         BSONElement dataElt = node->getData();
@@ -595,8 +616,7 @@ void IndexBoundsBuilder::_translatePredicate(const MatchExpression* expr,
         if (!interval.isNull()) {
             oilOut->intervals.push_back(interval);
         }
-
-        *tightnessOut = getInequalityPredicateTightness(dataElt, index);
+        *tightnessOut = getInequalityPredicateTightness(interval, dataElt, index);
     } else if (MatchExpression::GTE == expr->matchType()) {
         const GTEMatchExpression* node = static_cast<const GTEMatchExpression*>(expr);
         BSONElement dataElt = node->getData();
@@ -617,6 +637,13 @@ void IndexBoundsBuilder::_translatePredicate(const MatchExpression* expr,
             return;
         }
 
+        if (BSONType::jstNULL == dataElt.type()) {
+            // Because of type-bracketing, $lte null is equivalent to $eq null. An equality to null
+            // query is special. It should return both undefined and null values.
+            makeNullEqualityBounds(index, isHashed, oilOut, tightnessOut);
+            return;
+        }
+
         BSONObjBuilder bob;
         CollationIndexKey::collationAwareIndexKeyAppend(dataElt, index.collator, &bob);
         if (dataElt.isNumber()) {
@@ -627,10 +654,11 @@ void IndexBoundsBuilder::_translatePredicate(const MatchExpression* expr,
         BSONObj dataObj = bob.obj();
         verify(dataObj.isOwned());
 
-        oilOut->intervals.push_back(makeRangeInterval(
-            dataObj, IndexBounds::makeBoundInclusionFromBoundBools(true, typeMatch(dataObj))));
+        const Interval interval = makeRangeInterval(
+            dataObj, IndexBounds::makeBoundInclusionFromBoundBools(true, typeMatch(dataObj)));
+        oilOut->intervals.push_back(interval);
 
-        *tightnessOut = getInequalityPredicateTightness(dataElt, index);
+        *tightnessOut = getInequalityPredicateTightness(interval, dataElt, index);
     } else if (MatchExpression::REGEX == expr->matchType()) {
         const RegexMatchExpression* rme = static_cast<const RegexMatchExpression*>(expr);
         translateRegex(rme, index, oilOut, tightnessOut);

@@ -618,6 +618,18 @@ void TransactionParticipant::Participant::_setReadSnapshot(OperationContext* opC
         // Using 'kNoTimestamp' ensures that transactions with mode 'local' are always able to read
         // writes from earlier transactions with mode 'local' on the same connection.
         opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kNoTimestamp);
+        // Catalog conflicting timestamps must be set on primaries performing transactions.
+        // However, secondaries performing oplog application must avoid setting
+        // _catalogConflictTimestamp. Currently, only oplog application on secondaries can run
+        // inside a transaction, thus `writesAreReplicated` is a suitable proxy to single out
+        // transactions on primaries.
+        if (opCtx->writesAreReplicated()) {
+            // Since this snapshot may reflect oplog holes, record the most visible timestamp before
+            // opening a storage transaction. This timestamp will be used later to detect any
+            // changes in the catalog after a storage transaction is opened.
+            opCtx->recoveryUnit()->setCatalogConflictingTimestamp(
+                opCtx->getServiceContext()->getStorageEngine()->getAllDurableTimestamp());
+        }
     }
 
     opCtx->recoveryUnit()->preallocateSnapshot();
@@ -664,13 +676,6 @@ TransactionParticipant::OplogSlotReserver::~OplogSlotReserver() {
         // side transaction.
         _recoveryUnit->abortUnitOfWork();
     }
-
-    // After releasing the oplog hole, the all_durable timestamp can advance past this oplog hole,
-    // if there are no other open holes. Check if we can advance the stable timestamp any further
-    // since a majority write may be waiting on the stable timestamp to advance beyond this oplog
-    // hole to acknowledge the write to the user.
-    auto replCoord = repl::ReplicationCoordinator::get(_opCtx);
-    replCoord->attemptToAdvanceStableTimestamp();
 }
 
 TransactionParticipant::TxnResources::TxnResources(WithLock wl,
@@ -1287,13 +1292,15 @@ void TransactionParticipant::Participant::commitUnpreparedTransaction(OperationC
     auto wc = opCtx->getWriteConcern();
     auto needsNoopWrite = txnOps.empty() && !opCtx->getWriteConcern().usedDefault;
 
+    const size_t operationCount = p().transactionOperations.size();
+    const size_t oplogOperationBytes = p().transactionOperationBytes;
     clearOperationsInMemory(opCtx);
 
     try {
         // Once committing we cannot throw an exception.
         UninterruptibleLockGuard noInterrupt(opCtx->lockState());
         _commitStorageTransaction(opCtx);
-        _finishCommitTransaction(opCtx);
+        _finishCommitTransaction(opCtx, operationCount, oplogOperationBytes);
     } catch (...) {
         // It is illegal for committing a transaction to fail for any reason, other than an
         // invalid command, so we crash instead.
@@ -1415,9 +1422,11 @@ void TransactionParticipant::Participant::commitPreparedTransaction(
         opObserver->onPreparedTransactionCommit(
             opCtx, commitOplogSlot, commitTimestamp, retrieveCompletedTransactionOperations(opCtx));
 
+        const size_t operationCount = p().transactionOperations.size();
+        const size_t oplogOperationBytes = p().transactionOperationBytes;
         clearOperationsInMemory(opCtx);
 
-        _finishCommitTransaction(opCtx);
+        _finishCommitTransaction(opCtx, operationCount, oplogOperationBytes);
     } catch (...) {
         // It is illegal for committing a prepared transaction to fail for any reason, other than an
         // invalid command, so we crash instead.
@@ -1448,15 +1457,20 @@ void TransactionParticipant::Participant::_commitStorageTransaction(OperationCon
     std::terminate();
 }
 
-void TransactionParticipant::Participant::_finishCommitTransaction(OperationContext* opCtx) {
+void TransactionParticipant::Participant::_finishCommitTransaction(OperationContext* opCtx,
+                                                                   size_t operationCount,
+                                                                   size_t oplogOperationBytes) {
     {
         auto tickSource = opCtx->getServiceContext()->getTickSource();
         stdx::lock_guard<Client> lk(*opCtx->getClient());
         o(lk).txnState.transitionTo(TransactionState::kCommitted);
 
-        o(lk).transactionMetricsObserver.onCommit(ServerTransactionsMetrics::get(opCtx),
+        o(lk).transactionMetricsObserver.onCommit(opCtx,
+                                                  ServerTransactionsMetrics::get(opCtx),
                                                   tickSource,
-                                                  &Top::get(getGlobalServiceContext()));
+                                                  &Top::get(getGlobalServiceContext()),
+                                                  operationCount,
+                                                  oplogOperationBytes);
         o(lk).transactionMetricsObserver.onTransactionOperation(
             opCtx, CurOp::get(opCtx)->debug().additiveMetrics, o().txnState.isPrepared());
     }

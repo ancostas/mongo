@@ -99,16 +99,23 @@ namespace repl {
 MONGO_FAIL_POINT_DEFINE(stepdownHangBeforePerformingPostMemberStateUpdateActions);
 MONGO_FAIL_POINT_DEFINE(holdStableTimestampAtSpecificTimestamp);
 MONGO_FAIL_POINT_DEFINE(stepdownHangBeforeRSTLEnqueue);
+// Fail setMaintenanceMode with ErrorCodes::NotSecondary to simulate a concurrent election.
+MONGO_FAIL_POINT_DEFINE(setMaintenanceModeFailsWithNotSecondary);
 
-// Tracks the number of operations killed on step down.
+// Tracks the last state transition performed in this replca set.
+std::string lastStateTransition;
+ServerStatusMetricField<std::string> displayLastStateTransition(
+    "repl.stateTransition.lastStateTransition", &lastStateTransition);
+
+// Tracks the number of operations killed on state transition.
 Counter64 userOpsKilled;
-ServerStatusMetricField<Counter64> displayuserOpsKilled("repl.stepDown.userOperationsKilled",
+ServerStatusMetricField<Counter64> displayUserOpsKilled("repl.stateTransition.userOperationsKilled",
                                                         &userOpsKilled);
 
-// Tracks the number of operations left running on step down.
+// Tracks the number of operations left running on state transition.
 Counter64 userOpsRunning;
-ServerStatusMetricField<Counter64> displayUserOpsRunning("repl.stepDown.userOperationsRunning",
-                                                         &userOpsRunning);
+ServerStatusMetricField<Counter64> displayUserOpsRunning(
+    "repl.stateTransition.userOperationsRunning", &userOpsRunning);
 
 using CallbackArgs = executor::TaskExecutor::CallbackArgs;
 using CallbackFn = executor::TaskExecutor::CallbackFn;
@@ -581,9 +588,11 @@ void ReplicationCoordinatorImpl::_finishLoadLocalConfig(
         myIndex = StatusWith<int>(-1);
     }
 
-    if (serverGlobalParams.enableMajorityReadConcern && localConfig.containsArbiter()) {
+    if (serverGlobalParams.enableMajorityReadConcern && localConfig.getNumMembers() == 3 &&
+        localConfig.getNumDataBearingMembers() == 2) {
         log() << startupWarningsLog;
-        log() << "** WARNING: This replica set uses arbiters, but readConcern:majority is enabled "
+        log() << "** WARNING: This replica set has a Primary-Secondary-Arbiter architecture, but "
+                 "readConcern:majority is enabled "
               << startupWarningsLog;
         log() << "**          for this node. This is not a recommended configuration. Please see "
               << startupWarningsLog;
@@ -787,30 +796,7 @@ void ReplicationCoordinatorImpl::_startDataReplication(OperationContext* opCtx,
 void ReplicationCoordinatorImpl::startup(OperationContext* opCtx) {
     if (!isReplEnabled()) {
         if (ReplSettings::shouldRecoverFromOplogAsStandalone()) {
-            if (!_storage->supportsRecoveryTimestamp(opCtx->getServiceContext())) {
-                severe() << "Cannot use 'recoverFromOplogAsStandalone' with a storage engine that "
-                            "does not support recover to stable timestamp.";
-                fassertFailedNoTrace(50805);
-            }
-            auto recoveryTS = _storage->getRecoveryTimestamp(opCtx->getServiceContext());
-            if (!recoveryTS || recoveryTS->isNull()) {
-                severe()
-                    << "Cannot use 'recoverFromOplogAsStandalone' without a stable checkpoint.";
-                fassertFailedNoTrace(50806);
-            }
-
-            // Initialize the cached pointer to the oplog collection.
-            acquireOplogCollectionForLogging(opCtx);
-
-            // We pass in "none" for the stable timestamp so that recoverFromOplog asks storage
-            // for the recoveryTimestamp just like on replica set recovery.
-            const auto stableTimestamp = boost::none;
-            _replicationProcess->getReplicationRecovery()->recoverFromOplog(opCtx, stableTimestamp);
-            reconstructPreparedTransactions(opCtx, OplogApplication::Mode::kRecovering);
-
-            warning() << "Setting mongod to readOnly mode as a result of specifying "
-                         "'recoverFromOplogAsStandalone'.";
-            storageGlobalParams.readOnly = true;
+            _replicationProcess->getReplicationRecovery()->recoverFromOplogAsStandalone(opCtx);
         }
 
         stdx::lock_guard<Latch> lk(_mutex);
@@ -1045,7 +1031,8 @@ void ReplicationCoordinatorImpl::signalDrainComplete(OperationContext* opCtx,
     // internal operations. Although secondaries cannot accept writes, a step up can kill writes
     // that were blocked behind the RSTL lock held by a step down attempt. These writes will be
     // killed with a retryable error code during step up.
-    AutoGetRstlForStepUpStepDown arsu(this, opCtx);
+    AutoGetRstlForStepUpStepDown arsu(
+        this, opCtx, ReplicationCoordinator::OpsKillingStateTransitionEnum::kStepUp);
     lk.lock();
 
     // Exit drain mode only if we're actually in draining mode, the apply buffer is empty in the
@@ -1072,10 +1059,6 @@ void ReplicationCoordinatorImpl::signalDrainComplete(OperationContext* opCtx,
         }
         invariant(status);
     }
-
-    // Reset the counters on step up.
-    userOpsKilled.decrement(userOpsKilled.get());
-    userOpsRunning.decrement(userOpsRunning.get());
 
     // Must calculate the commit level again because firstOpTimeOfMyTerm wasn't set when we logged
     // our election in onTransitionToPrimary(), above.
@@ -1840,15 +1823,38 @@ void ReplicationCoordinatorImpl::waitForStepDownAttempt_forTest() {
     }
 }
 
-void ReplicationCoordinatorImpl::_updateAndLogStatsOnStepDown(
-    const AutoGetRstlForStepUpStepDown* arsd) const {
-    userOpsRunning.increment(arsd->getUserOpsRunning());
+void ReplicationCoordinatorImpl::updateAndLogStateTransitionMetrics(
+    const ReplicationCoordinator::OpsKillingStateTransitionEnum stateTransition,
+    const size_t numOpsKilled,
+    const size_t numOpsRunning) const {
+
+    // Clear the current metrics before setting.
+    userOpsKilled.decrement(userOpsKilled.get());
+    userOpsRunning.decrement(userOpsRunning.get());
+
+    switch (stateTransition) {
+        case ReplicationCoordinator::OpsKillingStateTransitionEnum::kStepUp:
+            lastStateTransition = "stepUp";
+            break;
+        case ReplicationCoordinator::OpsKillingStateTransitionEnum::kStepDown:
+            lastStateTransition = "stepDown";
+            break;
+        case ReplicationCoordinator::OpsKillingStateTransitionEnum::kRollback:
+            lastStateTransition = "rollback";
+            break;
+        default:
+            MONGO_UNREACHABLE;
+    }
+
+    userOpsKilled.increment(numOpsKilled);
+    userOpsRunning.increment(numOpsRunning);
 
     BSONObjBuilder bob;
+    bob.append("lastStateTransition", lastStateTransition);
     bob.appendNumber("userOpsKilled", userOpsKilled.get());
     bob.appendNumber("userOpsRunning", userOpsRunning.get());
 
-    log() << "Stepping down from primary, stats: " << bob.obj();
+    log() << "State transition ops metrics: " << bob.obj();
 }
 
 void ReplicationCoordinatorImpl::_killConflictingOpsOnStepUpAndStepDown(
@@ -1871,18 +1877,24 @@ void ReplicationCoordinatorImpl::_killConflictingOpsOnStepUpAndStepDown(
             if (locker->wasGlobalLockTakenInModeConflictingWithWrites() ||
                 PrepareConflictTracker::get(toKill).isWaitingOnPrepareConflict()) {
                 serviceCtx->killOperation(lk, toKill, reason);
-                userOpsKilled.increment();
+                arsc->incrementUserOpsKilled();
             } else {
-                arsc->incrUserOpsRunningBy();
+                arsc->incrementUserOpsRunning();
             }
         }
     }
 }
 
 ReplicationCoordinatorImpl::AutoGetRstlForStepUpStepDown::AutoGetRstlForStepUpStepDown(
-    ReplicationCoordinatorImpl* repl, OperationContext* opCtx, Date_t deadline)
-    : _replCord(repl), _opCtx(opCtx) {
+    ReplicationCoordinatorImpl* repl,
+    OperationContext* opCtx,
+    const ReplicationCoordinator::OpsKillingStateTransitionEnum stateTransition,
+    Date_t deadline)
+    : _replCord(repl), _opCtx(opCtx), _stateTransition(stateTransition) {
     invariant(_replCord && _opCtx);
+
+    // The state transition should never be rollback within this class.
+    invariant(_stateTransition != ReplicationCoordinator::OpsKillingStateTransitionEnum::kRollback);
 
     // Enqueues RSTL in X mode.
     _rstlLock.emplace(_opCtx, MODE_X, ReplicationStateTransitionLockGuard::EnqueueOnly());
@@ -1933,6 +1945,8 @@ void ReplicationCoordinatorImpl::AutoGetRstlForStepUpStepDown::_killOpThreadFn()
             if (_stopKillingOps.wait_for(
                     lock, Milliseconds(10).toSystemDuration(), [this] { return _killSignaled; })) {
                 log() << "Stopped killing user operations";
+                _replCord->updateAndLogStateTransitionMetrics(
+                    _stateTransition, getUserOpsKilled(), getUserOpsRunning());
                 _killSignaled = false;
                 return;
             }
@@ -1953,11 +1967,19 @@ void ReplicationCoordinatorImpl::AutoGetRstlForStepUpStepDown::_stopAndWaitForKi
     _killOpThread.reset();
 }
 
+size_t ReplicationCoordinatorImpl::AutoGetRstlForStepUpStepDown::getUserOpsKilled() const {
+    return _userOpsKilled;
+}
+
+void ReplicationCoordinatorImpl::AutoGetRstlForStepUpStepDown::incrementUserOpsKilled(size_t val) {
+    _userOpsKilled += val;
+}
+
 size_t ReplicationCoordinatorImpl::AutoGetRstlForStepUpStepDown::getUserOpsRunning() const {
     return _userOpsRunning;
 }
 
-void ReplicationCoordinatorImpl::AutoGetRstlForStepUpStepDown::incrUserOpsRunningBy(size_t val) {
+void ReplicationCoordinatorImpl::AutoGetRstlForStepUpStepDown::incrementUserOpsRunning(size_t val) {
     _userOpsRunning += val;
 }
 
@@ -2003,7 +2025,8 @@ void ReplicationCoordinatorImpl::stepDown(OperationContext* opCtx,
     // fail if it does not acquire the lock immediately. In such a scenario, we use the
     // stepDownUntil deadline instead.
     auto deadline = force ? stepDownUntil : waitUntil;
-    AutoGetRstlForStepUpStepDown arsd(this, opCtx, deadline);
+    AutoGetRstlForStepUpStepDown arsd(
+        this, opCtx, ReplicationCoordinator::OpsKillingStateTransitionEnum::kStepDown, deadline);
 
     stdx::unique_lock<Latch> lk(_mutex);
 
@@ -2120,7 +2143,6 @@ void ReplicationCoordinatorImpl::stepDown(OperationContext* opCtx,
     yieldLocksForPreparedTransactions(opCtx);
 
     lk.lock();
-    _updateAndLogStatsOnStepDown(&arsd);
 
     // Clear the node's election candidate metrics since it is no longer primary.
     ReplicationMetrics::get(opCtx).clearElectionCandidateMetrics();
@@ -2489,7 +2511,8 @@ Status ReplicationCoordinatorImpl::setMaintenanceMode(bool activate) {
     }
 
     stdx::unique_lock<Latch> lk(_mutex);
-    if (_topCoord->getRole() == TopologyCoordinator::Role::kCandidate) {
+    if (_topCoord->getRole() == TopologyCoordinator::Role::kCandidate ||
+        MONGO_unlikely(setMaintenanceModeFailsWithNotSecondary.shouldFail())) {
         return Status(ErrorCodes::NotSecondary, "currently running for election");
     }
 
@@ -2692,7 +2715,7 @@ void ReplicationCoordinatorImpl::_finishReplSetReconfig(OperationContext* opCtx,
 
         // Primary node won't be electable or removed after the configuration change.
         // So, finish the reconfig under RSTL, so that the step down occurs safely.
-        arsd.emplace(this, opCtx);
+        arsd.emplace(this, opCtx, ReplicationCoordinator::OpsKillingStateTransitionEnum::kStepDown);
 
         lk.lock();
         if (_topCoord->isSteppingDownUnconditionally()) {
@@ -2706,7 +2729,6 @@ void ReplicationCoordinatorImpl::_finishReplSetReconfig(OperationContext* opCtx,
             yieldLocksForPreparedTransactions(opCtx);
 
             lk.lock();
-            _updateAndLogStatsOnStepDown(&arsd.get());
 
             // Clear the node's election candidate metrics since it is no longer primary.
             ReplicationMetrics::get(opCtx).clearElectionCandidateMetrics();
@@ -3228,7 +3250,7 @@ ReplicationCoordinatorImpl::_setCurrentRSConfig(WithLock lk,
         (newConfig.getWriteConcernMajorityShouldJournal() &&
          (!oldConfig.isInitialized() || !oldConfig.getWriteConcernMajorityShouldJournal()))) {
         log() << startupWarningsLog;
-        log() << "** WARNING: This replica set is running without journaling enabled but the "
+        log() << "** WARNING: This replica set node is running without journaling enabled but the "
               << startupWarningsLog;
         log() << "**          writeConcernMajorityJournalDefault option to the replica set config "
               << startupWarningsLog;
@@ -3238,6 +3260,9 @@ ReplicationCoordinatorImpl::_setCurrentRSConfig(WithLock lk,
               << startupWarningsLog;
         log() << "**          or w:majority write concerns will never complete."
               << startupWarningsLog;
+        log() << "**          In addition, this node's memory consumption may increase until all"
+              << startupWarningsLog;
+        log() << "**          available free RAM is exhausted." << startupWarningsLog;
         log() << startupWarningsLog;
     }
 
@@ -3247,14 +3272,18 @@ ReplicationCoordinatorImpl::_setCurrentRSConfig(WithLock lk,
         (newConfig.getWriteConcernMajorityShouldJournal() &&
          (!oldConfig.isInitialized() || !oldConfig.getWriteConcernMajorityShouldJournal()))) {
         log() << startupWarningsLog;
-        log() << "** WARNING: This replica set is using in-memory (ephemeral) storage with the "
+        log() << "** WARNING: This replica set node is using in-memory (ephemeral) storage with the"
               << startupWarningsLog;
         log() << "**          writeConcernMajorityJournalDefault option to the replica set config "
               << startupWarningsLog;
         log() << "**          set to true. The writeConcernMajorityJournalDefault option to the "
               << startupWarningsLog;
-        log() << "**          replica set config is unsupported while using in-memory storage."
+        log() << "**          replica set config must be set to false " << startupWarningsLog;
+        log() << "**          or w:majority write concerns will never complete."
               << startupWarningsLog;
+        log() << "**          In addition, this node's memory consumption may increase until all"
+              << startupWarningsLog;
+        log() << "**          available free RAM is exhausted." << startupWarningsLog;
         log() << startupWarningsLog;
     }
 

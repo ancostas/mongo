@@ -219,6 +219,10 @@ functions:
           production: true
           authentication: ${authentication}
           overrides:
+            infrastructure_provisioning:
+              tfvars:
+                # This is currently only used by initialsync-logkeeper. It is empty and not used for other tests.
+                mongod_seeded_ebs_snapshot_id: ${snapshotId}
             workload_setup:
               local_repos:
                 workloads: ../src/workloads/workloads
@@ -227,6 +231,8 @@ functions:
                 tpcc: ../src/tpcc/tpcc
                 genny: ../src/genny/genny
             mongodb_setup:
+              # This is currently only used by initialsync-logkeeper-short. It is empty and not used for other tests.
+              mongodb_dataset: ${dataset}
               mongodb_binary_archive: "https://s3.amazonaws.com/mciuploads/${project_dir}/${version_id}/${revision}/${platform}/mongodb${compile-variant|}-${version_id}.tar.gz"
           EOF
 
@@ -564,16 +570,6 @@ tasks:
     - func: "run test"
     - func: "analyze"
 
-- name: jasper_smoke
-  priority: 5
-  commands:
-    - func: "prepare environment"
-      vars:
-        test: "jasper_smoke"
-    - func: "deploy cluster"
-    - func: "run test"
-    - func: "analyze"
-
 - name: genny_canaries
   priority: 5
   commands:
@@ -763,6 +759,8 @@ tasks:
       vars:
         test: "initialsync-logkeeper"
         setup: "initialsync-logkeeper-short"
+        # Logkeeper dataset with FCV set to 4.0
+        dataset: "https://s3-us-west-2.amazonaws.com/dsi-donot-remove/InitialSyncLogKeeper/logkeeper-slice-data.tgz"
     - func: "deploy cluster"
     - func: "run test"
     - func: "analyze"
@@ -961,7 +959,6 @@ buildvariants:
     - name: snapshot_reads
     - name: linkbench
     - name: tpcc
-    - name: jasper_smoke
     - name: insert_remove
     - name: big_update
 
@@ -985,7 +982,6 @@ buildvariants:
     - name: industry_benchmarks
     - name: ycsb_60GB
     - name: crud_workloads
-    - name: jasper_smoke
     - name: genny_canaries
     - name: genny_overhead
     - name: cursor_manager
@@ -1087,7 +1083,6 @@ buildvariants:
   tasks:
     - name: industry_benchmarks
     - name: crud_workloads
-    - name: jasper_smoke
     - name: insert_remove
     - name: mixed_workloads
     - name: misc_workloads
@@ -1158,7 +1153,6 @@ buildvariants:
     - name: ycsb_60GB
     - name: industry_benchmarks_secondary_reads
     - name: crud_workloads
-    - name: jasper_smoke
     - name: insert_remove
     - name: service_architecture_workloads
     - name: mixed_workloads
@@ -1260,6 +1254,8 @@ buildvariants:
   expansions:
     setup: initialsync-logkeeper
     cluster: initialsync-logkeeper
+    # EBS logkeeper snapshot with FCV set to 4.0
+    snapshotId: snap-041c3c57a1a4f5bba
     platform: linux
     # TODO(TIG-1506): enabled authentication on initialsync variants
     authentication: disabled
@@ -1298,7 +1294,6 @@ buildvariants:
     - name: ycsb_60GB
     - name: industry_benchmarks_secondary_reads
     - name: crud_workloads
-    - name: jasper_smoke
     # - name: insert_remove
     # - name: service_architecture_workloads
     - name: mixed_workloads

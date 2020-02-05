@@ -18,6 +18,20 @@ __cursor_set_recno(WT_CURSOR_BTREE *cbt, uint64_t v)
 }
 
 /*
+ * __cursor_copy_release --
+ *     Release memory used by the key and value in cursor copy debug mode.
+ */
+static inline int
+__cursor_copy_release(WT_CURSOR *cursor)
+{
+    if (F_ISSET(S2C((WT_SESSION_IMPL *)cursor->session), WT_CONN_DEBUG_CURSOR_COPY)) {
+        WT_RET(__wt_cursor_copy_release_item(cursor, &cursor->key));
+        WT_RET(__wt_cursor_copy_release_item(cursor, &cursor->value));
+    }
+    return (0);
+}
+
+/*
  * __cursor_novalue --
  *     Release any cached value before an operation that could update the transaction context and
  *     free data a value is pointing to.
@@ -303,10 +317,10 @@ __wt_cursor_dhandle_decr_use(WT_SESSION_IMPL *session)
  *     Return a page referenced key/value pair to the application.
  */
 static inline int
-__cursor_kv_return(WT_SESSION_IMPL *session, WT_CURSOR_BTREE *cbt, WT_UPDATE *upd)
+__cursor_kv_return(WT_CURSOR_BTREE *cbt, WT_UPDATE *upd)
 {
-    WT_RET(__wt_key_return(session, cbt));
-    WT_RET(__wt_value_return(session, cbt, upd));
+    WT_RET(__wt_key_return(cbt));
+    WT_RET(__wt_value_return(cbt, upd));
 
     return (0);
 }
@@ -441,7 +455,7 @@ value:
      * (if any) is visible.
      */
     if (upd != NULL)
-        return (__wt_value_return(session, cbt, upd));
+        return (__wt_value_return(cbt, upd));
 
     /* Else, simple values have their location encoded in the WT_ROW. */
     if (__wt_row_leaf_value(page, rip, vb))
